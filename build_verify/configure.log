@@ -1,0 +1,14 @@
+  disabling examples
+  disabling tools
+  disabling docs
+  enabling unit_tests
+  enabling vp8_encoder
+  enabling vp8_decoder
+  enabling vp9_encoder
+  enabling vp9_decoder
+Configuring for target 'generic-gnu'
+  enabling generic
+  enabling pic
+  enabling webm_io
+  enabling libyuv
+Creating makefiles for generic-gnu libs

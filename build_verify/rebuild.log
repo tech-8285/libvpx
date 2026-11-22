@@ -1,0 +1,4 @@
+    [DEP] test/resize_test.cc.d
+    [CXX] test/resize_test.cc.o
+    [LD] test_libvpx
+ld: warning: ignoring duplicate libraries: '-lpthread'

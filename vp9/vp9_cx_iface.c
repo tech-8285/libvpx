@@ -857,22 +857,22 @@ static vpx_codec_err_t encoder_set_config(vpx_codec_alg_priv_t *ctx,
     if (cfg->g_lag_in_frames > 1 || cfg->g_pass != VPX_RC_ONE_PASS)
       ERROR("Cannot change width or height after initialization");
     // Note: function encoder_set_config() is allowed to be called multiple
-    // times. However, when the original frame width or height is less than two
-    // times of the new frame width or height, a forced key frame should be
-    // used (for the case of single spatial layer, since otherwise a previous
-    //  encoded frame at a lower layer may be the desired reference). To make
-    //  sure the correct detection of a forced key frame, we need
-    // to update the frame width and height only when the actual encoding is
-    // performed. cpi->last_coded_width and cpi->last_coded_height are used to
-    // track the actual coded frame size.
-    if ((ctx->cpi->last_coded_width && ctx->cpi->last_coded_height &&
-         (!valid_ref_frame_size(ctx->cpi->last_coded_width,
-                                ctx->cpi->last_coded_height, cfg->g_w,
-                                cfg->g_h) &&
-          ctx->cpi->svc.number_spatial_layers == 1)) ||
-        (ctx->cpi->initial_width && (int)cfg->g_w > ctx->cpi->initial_width) ||
-        (ctx->cpi->initial_height &&
-         (int)cfg->g_h > ctx->cpi->initial_height)) {
+    // times. For a single spatial layer, whether a key frame is forced is
+    // decided when the next frame is actually encoded (see encoder_encode),
+    // based on the frame size really sent to the encoder: every actual
+    // change of the coded size then starts a new segment that can be joined
+    // from scratch, while config updates that leave the coded size unchanged
+    // (e.g. several updates ahead of the same input frame) do not.
+    // cpi->last_coded_width and cpi->last_coded_height are used to track the
+    // actual coded frame size.
+    // For multiple spatial layers a key frame is still forced here when the
+    // new size exceeds the initially allocated one, so that the inter-layer
+    // reference constraints keep being satisfied.
+    if (ctx->cpi->svc.number_spatial_layers > 1 &&
+        ((ctx->cpi->initial_width &&
+          (int)cfg->g_w > ctx->cpi->initial_width) ||
+         (ctx->cpi->initial_height &&
+          (int)cfg->g_h > ctx->cpi->initial_height))) {
       force_key = 1;
     }
   }
@@ -1424,10 +1424,26 @@ static vpx_codec_err_t encoder_encode(vpx_codec_alg_priv_t *ctx,
 
   if (cpi == NULL) return VPX_CODEC_INVALID_PARAM;
 
-  cpi->last_coded_width = ctx->oxcf.width;
-  cpi->last_coded_height = ctx->oxcf.height;
-
   if (img != NULL) {
+    // For a single spatial layer, turn every actual change of the coded
+    // frame size into a point where the stream can be joined from scratch:
+    // force the first frame coded at the new size to be a key frame. The
+    // decision is made here, on the frame actually handed to the encoder, so
+    // that capture config updates applied multiple times ahead of the same
+    // input frame only cut the stream when the coded size really changes.
+    // Rate control state and display timestamps keep their progress, and
+    // stretches coded at an unchanged size keep their regular key frame
+    // cadence. For multiple spatial layers the inter-layer reference
+    // constraints are handled in encoder_set_config() instead.
+    if (cpi->last_coded_width != 0 && cpi->last_coded_height != 0 &&
+        (ctx->oxcf.width != cpi->last_coded_width ||
+         ctx->oxcf.height != cpi->last_coded_height) &&
+        cpi->svc.number_spatial_layers == 1) {
+      flags |= VPX_EFLAG_FORCE_KF;
+    }
+    cpi->last_coded_width = ctx->oxcf.width;
+    cpi->last_coded_height = ctx->oxcf.height;
+
     res = validate_img(ctx, img);
     if (res != VPX_CODEC_OK) {
       return res;

@@ -838,6 +838,145 @@ TEST_P(ResizeCspTest, TestResizeCspWorks) {
   ASSERT_NO_FATAL_FAILURE(RunLoop(&video));
 }
 
+#if CONFIG_VP9_DECODER
+// For a single layer stream, every actual change of the coded frame size
+// must start a segment that can be joined from scratch: the first frame
+// coded at the new size is a key frame. Config updates that cancel out
+// ahead of the same input frame must not cut the stream, and stretches
+// without a size change keep the regular key frame cadence.
+const unsigned int kKeyOnSwitchWidth = 320;
+const unsigned int kKeyOnSwitchHeight = 240;
+const unsigned int kFirstSwitchFrame = 20;
+const unsigned int kSecondSwitchFrame = 40;
+const unsigned int kNoopConfigFrame = 10;
+const unsigned int kKeyOnSwitchFrames = 60;
+
+class SizeSwitchingVideoSource : public ::libvpx_test::DummyVideoSource {
+ public:
+  SizeSwitchingVideoSource() {
+    limit_ = kKeyOnSwitchFrames;
+    SetSize(kKeyOnSwitchWidth, kKeyOnSwitchHeight);
+  }
+
+ protected:
+  void Next() override {
+    ++frame_;
+    // Switch the capture size twice: down at kFirstSwitchFrame, back up at
+    // kSecondSwitchFrame.
+    if (frame_ < kFirstSwitchFrame) {
+      SetSize(kKeyOnSwitchWidth, kKeyOnSwitchHeight);
+    } else if (frame_ < kSecondSwitchFrame) {
+      SetSize(kKeyOnSwitchWidth / 2, kKeyOnSwitchHeight / 2);
+    } else {
+      SetSize(kKeyOnSwitchWidth, kKeyOnSwitchHeight);
+    }
+    FillFrame();
+  }
+
+  void FillFrame() override {
+    // Static content, so that no scene-cut key frame can fire.
+    if (img_) memset(img_->img_data, 0, raw_sz_);
+  }
+};
+
+class ExternalResizeKeyFrameTest
+    : public ::libvpx_test::EncoderTest,
+      public ::libvpx_test::CodecTestWithParam<libvpx_test::TestMode> {
+ protected:
+  ExternalResizeKeyFrameTest() : EncoderTest(GET_PARAM(0)) {}
+  ~ExternalResizeKeyFrameTest() override = default;
+
+  void SetUp() override {
+    InitializeConfig();
+    SetMode(GET_PARAM(1));
+    cfg_.g_lag_in_frames = 0;
+    // Keep automatic key frames out of the way, so that the only key frames
+    // may come from actual changes of the coded frame size.
+    cfg_.kf_min_dist = cfg_.kf_max_dist = 10000;
+  }
+
+  void PreEncodeFrameHook(libvpx_test::VideoSource *video,
+                          libvpx_test::Encoder *encoder) override {
+    // Ahead of this frame the capture config is switched to another size
+    // and back while the input frames keep their size: the stream must not
+    // be cut.
+    if (video->frame() == kNoopConfigFrame) {
+      const unsigned int w = cfg_.g_w;
+      const unsigned int h = cfg_.g_h;
+      cfg_.g_w = w / 2;
+      cfg_.g_h = h / 2;
+      encoder->Config(&cfg_);
+      cfg_.g_w = w;
+      cfg_.g_h = h;
+      encoder->Config(&cfg_);
+    }
+  }
+
+  void FramePktHook(const vpx_codec_cx_pkt_t *pkt) override {
+    FramePkt pkt_copy;
+    pkt_copy.pts = pkt->data.frame.pts;
+    pkt_copy.is_key = (pkt->data.frame.flags & VPX_FRAME_IS_KEY) != 0;
+    pkt_copy.w = pkt->data.frame.width[0];
+    pkt_copy.h = pkt->data.frame.height[0];
+    const uint8_t *const begin =
+        reinterpret_cast<const uint8_t *>(pkt->data.frame.buf);
+    pkt_copy.data.assign(begin, begin + pkt->data.frame.sz);
+    packets_.push_back(pkt_copy);
+  }
+
+  struct FramePkt {
+    vpx_codec_pts_t pts;
+    bool is_key;
+    unsigned int w;
+    unsigned int h;
+    std::vector<uint8_t> data;
+  };
+  std::vector<FramePkt> packets_;
+};
+
+TEST_P(ExternalResizeKeyFrameTest, KeyFrameAtEachActualSizeSwitch) {
+  SizeSwitchingVideoSource video;
+  ASSERT_NO_FATAL_FAILURE(RunLoop(&video));
+
+  ASSERT_EQ(packets_.size(), kKeyOnSwitchFrames);
+  for (size_t i = 0; i < packets_.size(); ++i) {
+    // Only the very first frame and the first frame of each new size may be
+    // a key frame; in particular the config updates that cancel out ahead
+    // of frame kNoopConfigFrame must not have cut the stream.
+    const bool expect_key =
+        (i == 0 || i == kFirstSwitchFrame || i == kSecondSwitchFrame);
+    EXPECT_EQ(expect_key, packets_[i].is_key) << "frame " << i;
+    const unsigned int expect_w =
+        (i >= kFirstSwitchFrame && i < kSecondSwitchFrame)
+            ? kKeyOnSwitchWidth / 2
+            : kKeyOnSwitchWidth;
+    EXPECT_EQ(expect_w, packets_[i].w) << "frame " << i;
+  }
+
+  // Each size switch must be a point where playback can be started from
+  // scratch: a fresh decoder must be able to join at the key frame that
+  // starts the new size and decode the rest of the stream.
+  for (size_t start : { kFirstSwitchFrame, kSecondSwitchFrame }) {
+    vpx_codec_ctx_t dec;
+    ASSERT_EQ(vpx_codec_dec_init(&dec, vpx_codec_vp9_dx(), nullptr, 0),
+              VPX_CODEC_OK);
+    unsigned int decoded = 0;
+    for (size_t i = start; i < packets_.size(); ++i) {
+      ASSERT_EQ(vpx_codec_decode(&dec, packets_[i].data.data(),
+                                 static_cast<unsigned int>(
+                                     packets_[i].data.size()),
+                                 nullptr, 0),
+                VPX_CODEC_OK)
+          << "frame " << i;
+      vpx_codec_iter_t iter = nullptr;
+      while (vpx_codec_get_frame(&dec, &iter) != nullptr) ++decoded;
+    }
+    EXPECT_EQ(packets_.size() - start, decoded);
+    ASSERT_EQ(vpx_codec_destroy(&dec), VPX_CODEC_OK);
+  }
+}
+#endif  // CONFIG_VP9_DECODER
+
 VP8_INSTANTIATE_TEST_SUITE(ResizeTest, ONE_PASS_TEST_MODES);
 VP9_INSTANTIATE_TEST_SUITE(ResizeTest, ONE_PASS_TEST_MODES);
 VP9_INSTANTIATE_TEST_SUITE(ResizeInternalTest,
@@ -847,4 +986,7 @@ VP9_INSTANTIATE_TEST_SUITE(ResizeRealtimeTest,
                            ::testing::Range(5, 9));
 VP9_INSTANTIATE_TEST_SUITE(ResizeCspTest,
                            ::testing::Values(::libvpx_test::kRealTime));
+#if CONFIG_VP9_DECODER
+VP9_INSTANTIATE_TEST_SUITE(ExternalResizeKeyFrameTest, ONE_PASS_TEST_MODES);
+#endif
 }  // namespace
