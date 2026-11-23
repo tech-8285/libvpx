@@ -713,6 +713,14 @@ struct stream_state {
   unsigned int frames_out;
   uint64_t cx_time;
   size_t nbytes;
+  /* Per-output IVF assembly state: a single picture may be delivered as
+   * several coded partitions, which are merged into one IVF frame record.
+   * These must be tracked per stream so concurrent outputs don't clobber
+   * each other's pending frame header.
+   */
+  size_t ivf_frame_size;
+  FileOffset ivf_header_pos;
+  unsigned int ivf_frames_written;
   stats_io_t stats;
   struct vpx_image *img;
   vpx_codec_ctx_t decoder;
@@ -1295,7 +1303,8 @@ static void open_output_file(struct stream_state *stream,
 #endif
 
   if (!stream->config.write_webm) {
-    ivf_write_file_header(stream->file, cfg, global->codec->fourcc, 0);
+    if (!ivf_write_file_header(stream->file, cfg, global->codec->fourcc, 0))
+      fatal("Stream %d: Failed to write IVF file header", stream->index);
   }
 }
 
@@ -1312,9 +1321,14 @@ static void close_output_file(struct stream_state *stream,
 #endif
 
   if (!stream->config.write_webm) {
-    if (!fseek(stream->file, 0, SEEK_SET))
-      ivf_write_file_header(stream->file, &stream->config.cfg, fourcc,
-                            stream->frames_out);
+    /* Finalize the header with the number of frame records this output
+     * actually completed, so frames already written remain readable even
+     * if a later write failed.
+     */
+    if (!fseek(stream->file, 0, SEEK_SET) &&
+        !ivf_write_file_header(stream->file, &stream->config.cfg, fourcc,
+                               stream->ivf_frames_written))
+      warn("Stream %d: Failed to finalize IVF file header", stream->index);
   }
 
   fclose(stream->file);
@@ -1340,6 +1354,9 @@ static void setup_pass(struct stream_state *stream,
   stream->cx_time = 0;
   stream->nbytes = 0;
   stream->frames_out = 0;
+  stream->ivf_frame_size = 0;
+  stream->ivf_header_pos = 0;
+  stream->ivf_frames_written = 0;
 }
 
 static void initialize_encoder(struct stream_state *stream,
@@ -1478,17 +1495,18 @@ static void update_quantizer_histogram(struct stream_state *stream) {
   }
 }
 
-static void get_cx_data(struct stream_state *stream,
-                        struct VpxEncoderConfig *global, int *got_data) {
+/* Returns 0 on success, -1 if writing to the output file failed. On failure
+ * the caller is expected to stop encoding so the partially written output
+ * can be finalized with the frames completed so far.
+ */
+static int get_cx_data(struct stream_state *stream,
+                       struct VpxEncoderConfig *global, int *got_data) {
   const vpx_codec_cx_pkt_t *pkt;
   const struct vpx_codec_enc_cfg *cfg = &stream->config.cfg;
   vpx_codec_iter_t iter = NULL;
 
   *got_data = 0;
   while ((pkt = vpx_codec_get_cx_data(&stream->encoder, &iter))) {
-    static size_t fsize = 0;
-    static FileOffset ivf_header_pos = 0;
-
     switch (pkt->kind) {
       case VPX_CODEC_CX_FRAME_PKT:
         if (!(pkt->data.frame.flags & VPX_FRAME_IS_FRAGMENT)) {
@@ -1505,23 +1523,49 @@ static void get_cx_data(struct stream_state *stream,
 #endif
         if (!stream->config.write_webm) {
           if (pkt->data.frame.partition_id <= 0) {
-            ivf_header_pos = ftello(stream->file);
-            fsize = pkt->data.frame.sz;
+            /* Start a new IVF frame record: one record holds the coded data
+             * of a whole picture, even when it arrives as several
+             * partitions. The full 64-bit pts (in this stream's timebase)
+             * is preserved in the record header.
+             */
+            stream->ivf_header_pos = ftello(stream->file);
+            stream->ivf_frame_size = pkt->data.frame.sz;
 
-            ivf_write_frame_header(stream->file, pkt->data.frame.pts, fsize);
+            if (!ivf_write_frame_header(stream->file, pkt->data.frame.pts,
+                                        pkt->data.frame.sz)) {
+              warn("Stream %d: Failed to write IVF frame header",
+                   stream->index);
+              return -1;
+            }
           } else {
-            fsize += pkt->data.frame.sz;
+            stream->ivf_frame_size += pkt->data.frame.sz;
 
             if (!(pkt->data.frame.flags & VPX_FRAME_IS_FRAGMENT)) {
+              /* Last partition of the picture: patch the pending record's
+               * size in this stream's own file.
+               */
               const FileOffset currpos = ftello(stream->file);
-              fseeko(stream->file, ivf_header_pos, SEEK_SET);
-              ivf_write_frame_size(stream->file, fsize);
-              fseeko(stream->file, currpos, SEEK_SET);
+              if (fseeko(stream->file, stream->ivf_header_pos, SEEK_SET) ||
+                  !ivf_write_frame_size(stream->file,
+                                        stream->ivf_frame_size) ||
+                  fseeko(stream->file, currpos, SEEK_SET)) {
+                warn("Stream %d: Failed to update IVF frame size",
+                     stream->index);
+                return -1;
+              }
             }
           }
 
-          (void)fwrite(pkt->data.frame.buf, 1, pkt->data.frame.sz,
-                       stream->file);
+          if (fwrite(pkt->data.frame.buf, 1, pkt->data.frame.sz,
+                     stream->file) != pkt->data.frame.sz) {
+            warn("Stream %d: Failed to write frame data", stream->index);
+            return -1;
+          }
+
+          if (!(pkt->data.frame.flags & VPX_FRAME_IS_FRAGMENT)) {
+            /* The record for this picture is now complete. */
+            stream->ivf_frames_written++;
+          }
         }
         stream->nbytes += pkt->data.raw.sz;
 
@@ -1565,6 +1609,8 @@ static void get_cx_data(struct stream_state *stream,
       default: break;
     }
   }
+
+  return 0;
 }
 
 static void show_psnr(struct stream_state *stream, double peak) {
@@ -1703,6 +1749,7 @@ int main(int argc, const char **argv_) {
   uint64_t cx_time = 0;
   int stream_cnt = 0;
   int res = 0;
+  int write_error = 0;
 
   memset(&input, 0, sizeof(input));
   memset(&raw, 0, sizeof(raw));
@@ -1964,7 +2011,17 @@ int main(int argc, const char **argv_) {
         FOREACH_STREAM(update_quantizer_histogram(stream));
 
         got_data = 0;
-        FOREACH_STREAM(get_cx_data(stream, &global, &got_data));
+        FOREACH_STREAM({
+          if (get_cx_data(stream, &global, &got_data)) write_error = 1;
+        });
+
+        if (write_error) {
+          /* Stop encoding. The outputs are finalized below so that the
+           * frames already written remain readable.
+           */
+          frame_avail = 0;
+          got_data = 0;
+        }
 
         if (!got_data && input.length && streams != NULL &&
             !streams->frames_out) {
@@ -2042,6 +2099,14 @@ int main(int argc, const char **argv_) {
     FOREACH_STREAM(close_output_file(stream, global.codec->fourcc));
 
     FOREACH_STREAM(stats_close(&stream->stats, global.passes - 1));
+
+    if (write_error) {
+      /* Report the failed recording to the caller after finalizing the
+       * outputs.
+       */
+      res = 1;
+      break;
+    }
 
     if (global.pass) break;
   }

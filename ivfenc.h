@@ -21,17 +21,21 @@ struct vpx_codec_cx_pkt;
 extern "C" {
 #endif
 
-void ivf_write_file_header_with_video_info(FILE *outfile, unsigned int fourcc,
-                                           int frame_cnt, int frame_width,
-                                           int frame_height,
-                                           vpx_rational_t timebase);
+/* Each of these functions returns 1 on success and 0 on write failure, so
+ * that callers can propagate I/O errors instead of silently producing
+ * truncated files.
+ */
+int ivf_write_file_header_with_video_info(FILE *outfile, unsigned int fourcc,
+                                          int frame_cnt, int frame_width,
+                                          int frame_height,
+                                          vpx_rational_t timebase);
 
-void ivf_write_file_header(FILE *outfile, const struct vpx_codec_enc_cfg *cfg,
-                           uint32_t fourcc, int frame_cnt);
+int ivf_write_file_header(FILE *outfile, const struct vpx_codec_enc_cfg *cfg,
+                          uint32_t fourcc, int frame_cnt);
 
-void ivf_write_frame_header(FILE *outfile, int64_t pts, size_t frame_size);
+int ivf_write_frame_header(FILE *outfile, int64_t pts, size_t frame_size);
 
-void ivf_write_frame_size(FILE *outfile, size_t frame_size);
+int ivf_write_frame_size(FILE *outfile, size_t frame_size);
 
 #ifdef __cplusplus
 } /* extern "C" */

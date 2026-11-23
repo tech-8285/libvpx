@@ -13,10 +13,10 @@
 #include "vpx/vpx_encoder.h"
 #include "vpx_ports/mem_ops.h"
 
-void ivf_write_file_header_with_video_info(FILE *outfile, unsigned int fourcc,
-                                           int frame_cnt, int frame_width,
-                                           int frame_height,
-                                           vpx_rational_t timebase) {
+int ivf_write_file_header_with_video_info(FILE *outfile, unsigned int fourcc,
+                                          int frame_cnt, int frame_width,
+                                          int frame_height,
+                                          vpx_rational_t timebase) {
   char header[32];
 
   header[0] = 'D';
@@ -33,27 +33,28 @@ void ivf_write_file_header_with_video_info(FILE *outfile, unsigned int fourcc,
   mem_put_le32(header + 24, frame_cnt);     // length
   mem_put_le32(header + 28, 0);             // unused
 
-  fwrite(header, 1, 32, outfile);
+  return fwrite(header, 1, 32, outfile) == 32;
 }
 
-void ivf_write_file_header(FILE *outfile, const struct vpx_codec_enc_cfg *cfg,
-                           unsigned int fourcc, int frame_cnt) {
-  ivf_write_file_header_with_video_info(outfile, fourcc, frame_cnt, cfg->g_w,
-                                        cfg->g_h, cfg->g_timebase);
+int ivf_write_file_header(FILE *outfile, const struct vpx_codec_enc_cfg *cfg,
+                          unsigned int fourcc, int frame_cnt) {
+  return ivf_write_file_header_with_video_info(outfile, fourcc, frame_cnt,
+                                               cfg->g_w, cfg->g_h,
+                                               cfg->g_timebase);
 }
 
-void ivf_write_frame_header(FILE *outfile, int64_t pts, size_t frame_size) {
+int ivf_write_frame_header(FILE *outfile, int64_t pts, size_t frame_size) {
   char header[12];
 
   mem_put_le32(header, (int)frame_size);
   mem_put_le32(header + 4, (int)(pts & 0xFFFFFFFF));
   mem_put_le32(header + 8, (int)(pts >> 32));
-  fwrite(header, 1, 12, outfile);
+  return fwrite(header, 1, 12, outfile) == 12;
 }
 
-void ivf_write_frame_size(FILE *outfile, size_t frame_size) {
+int ivf_write_frame_size(FILE *outfile, size_t frame_size) {
   char header[4];
 
   mem_put_le32(header, (int)frame_size);
-  fwrite(header, 1, 4, outfile);
+  return fwrite(header, 1, 4, outfile) == 4;
 }

@@ -20,15 +20,15 @@ struct VpxVideoWriterStruct {
   int frame_count;
 };
 
-static void write_header(FILE *file, const VpxVideoInfo *info,
-                         int frame_count) {
+static int write_header(FILE *file, const VpxVideoInfo *info,
+                        int frame_count) {
   struct vpx_codec_enc_cfg cfg;
   cfg.g_w = info->frame_width;
   cfg.g_h = info->frame_height;
   cfg.g_timebase.num = info->time_base.numerator;
   cfg.g_timebase.den = info->time_base.denominator;
 
-  ivf_write_file_header(file, &cfg, info->codec_fourcc, frame_count);
+  return ivf_write_file_header(file, &cfg, info->codec_fourcc, frame_count);
 }
 
 VpxVideoWriter *vpx_video_writer_open(const char *filename,
@@ -51,7 +51,12 @@ VpxVideoWriter *vpx_video_writer_open(const char *filename,
     writer->info = *info;
     writer->file = file;
 
-    write_header(writer->file, info, 0);
+    if (!write_header(writer->file, info, 0)) {
+      fprintf(stderr, "Failed to write IVF header to %s.\n", filename);
+      fclose(file);
+      free(writer);
+      return NULL;
+    }
 
     return writer;
   }
@@ -63,7 +68,8 @@ void vpx_video_writer_close(VpxVideoWriter *writer) {
   if (writer) {
     // Rewriting frame header with real frame count
     rewind(writer->file);
-    write_header(writer->file, &writer->info, writer->frame_count);
+    if (!write_header(writer->file, &writer->info, writer->frame_count))
+      fprintf(stderr, "Failed to finalize IVF header.\n");
 
     fclose(writer->file);
     free(writer);
@@ -72,7 +78,7 @@ void vpx_video_writer_close(VpxVideoWriter *writer) {
 
 int vpx_video_writer_write_frame(VpxVideoWriter *writer, const uint8_t *buffer,
                                  size_t size, int64_t pts) {
-  ivf_write_frame_header(writer->file, pts, size);
+  if (!ivf_write_frame_header(writer->file, pts, size)) return 0;
   if (fwrite(buffer, 1, size, writer->file) != size) return 0;
 
   ++writer->frame_count;
